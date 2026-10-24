@@ -1,0 +1,26 @@
+[project]
+name = "mattlerte"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Mattéo DETALLE", email = "matteo.detalle@student.junia.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+    "tzdata>=2026.5",
+]
+
+[project.scripts]
+mattlerte = "mattlerte.main:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

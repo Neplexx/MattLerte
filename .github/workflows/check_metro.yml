@@ -1,0 +1,33 @@
+name: Vérification Métro & Tram Ilévia
+
+on:
+  # Permet de lancer manuellement depuis l'onglet "Actions" sur GitHub pour tester
+  workflow_dispatch:
+
+  # Exécution automatique toutes les 5 minutes pendant les horaires de service Ilévia
+  # (03h00 à 00h59 UTC, ce qui couvre ~05h00 à 02h00 heure de Paris)
+  schedule:
+    - cron: "*/5 0,3-23 * * *"
+
+jobs:
+  check-ilevia:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Installation des dépendances Python
+        run: uv sync --frozen --no-dev
+
+      - name: Exécution de MattLerte
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+        run: uv run mattlerte
