@@ -1,7 +1,14 @@
+"""Tests unitaires du parsing Ilévia, de la fusion par ligne et du formatage Discord."""
+
 from datetime import datetime, timedelta
 
 from mattlerte.config import TIMEZONE
-from mattlerte.discord_client import FOOTER_REGEX, TrackedIncident, build_ongoing_embed, build_resolved_embed
+from mattlerte.discord_client import (
+    FOOTER_REGEX,
+    TrackedIncident,
+    build_ongoing_embed,
+    build_resolved_embed,
+)
 from mattlerte.ilevia import (
     Perturbation,
     SEVERITY_ORANGE,
@@ -168,5 +175,5 @@ def test_fetch_active_perturbations_merges_per_line(monkeypatch):
     tram = results[0]
     assert tram.line_name == "Tramway (R / T)"
     assert tram.format_date_str(now=now) == "24/10 (hier)"
-    assert "Dégâts météo / Intervention sur la caténaire" == tram.reason
+    assert tram.reason == "Dégâts météo / Intervention sur la caténaire"
     assert tram.stations == ["Foch - Tourcoing Centre", "Brossolette - Roubaix Eurotéléport"]

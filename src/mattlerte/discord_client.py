@@ -1,6 +1,9 @@
+"""Client REST Discord v10 pour la publication et la synchronisation sans base de données."""
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import re
+
 import requests
 
 from mattlerte.config import (
@@ -19,12 +22,10 @@ from mattlerte.ilevia import (
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
-# Couleurs d'Embed Discord
-COLOR_RED = 0xE30613     # Rouge Ilévia (Interruption)
-COLOR_ORANGE = 0xF39200  # Orange (Perturbation / Ralentissement)
-COLOR_GREEN = 0x2ECC71   # Vert (Fin de l'interruption)
+COLOR_RED = 0xE30613
+COLOR_ORANGE = 0xF39200
+COLOR_GREEN = 0x2ECC71
 
-# Footer discret : "réf: a98da15c99" ou "réf: a98da15c99 • résolu"
 FOOTER_REGEX = re.compile(
     r"^réf:\s*(?P<fp>[a-f0-9]+)(?:\s*•\s*(?P<resolved>résolu))?$"
 )
@@ -34,6 +35,8 @@ DATE_REGEX = re.compile(r"\*\*Date\s*:\*\*\s*(\d{2})/(\d{2})")
 
 @dataclass
 class TrackedIncident:
+    """Représente un message d'alerte actif déjà publié dans le salon Discord."""
+
     fingerprint: str
     message_id: str
     line_name: str
@@ -42,6 +45,7 @@ class TrackedIncident:
 
 
 def _headers() -> dict[str, str]:
+    """Construit les en-têtes d'authentification pour l'API Discord."""
     if not DISCORD_BOT_TOKEN:
         raise RuntimeError("La variable d'environnement DISCORD_BOT_TOKEN n'est pas définie.")
     if not DISCORD_CHANNEL_ID:
@@ -49,12 +53,12 @@ def _headers() -> dict[str, str]:
     return {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
         "Content-Type": "application/json",
-        "User-Agent": "MattLerte (https://github.com, 1.0)",
+        "User-Agent": "MattLerte (https://github.com/Neplexx/MattLerte, 0.1.0)",
     }
 
 
 def build_ongoing_embed(p: Perturbation, now: datetime | None = None) -> dict:
-    """Construit l'encadré épuré pour une interruption/perturbation en cours."""
+    """Construit l'Embed Discord rouge ou orange pour une perturbation en cours."""
     if now is None:
         now = datetime.now(TIMEZONE)
 
@@ -79,7 +83,7 @@ def build_ongoing_embed(p: Perturbation, now: datetime | None = None) -> dict:
 
 
 def build_resolved_embed(incident: TrackedIncident, now: datetime | None = None) -> dict:
-    """Construit l'encadré vert annonçant la fin de l'interruption."""
+    """Construit l'Embed Discord vert annonçant le rétablissement du trafic."""
     if now is None:
         now = datetime.now(TIMEZONE)
 
@@ -104,7 +108,7 @@ def build_resolved_embed(incident: TrackedIncident, now: datetime | None = None)
 
 
 def delete_message(message_id: str) -> None:
-    """Supprime un message du salon Discord."""
+    """Supprime un message du salon Discord (ignore silencieusement s'il a déjà été supprimé)."""
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages/{message_id}"
     response = requests.delete(url, headers=_headers(), timeout=15)
     if response.status_code not in (200, 204, 404):
@@ -115,12 +119,7 @@ def sync_channel_state(
     now: datetime | None = None,
     limit: int = 50,
 ) -> dict[str, TrackedIncident]:
-    """
-    Parcourt les derniers messages du salon Discord :
-    1. Supprime automatiquement les messages verts 'résolu' vieux de plus d'1h (RESOLVED_RETENTION_MINUTES).
-    2. Supprime les anciens messages d'une version précédente ou doublons d'une même ligne.
-    3. Retourne {fingerprint: TrackedIncident} des pannes actuellement affichées.
-    """
+    """Lit l'historique récent du salon, purge les messages expirés et retourne les pannes actives."""
     if now is None:
         now = datetime.now(TIMEZONE)
 
@@ -140,7 +139,6 @@ def sync_channel_state(
         embed = embeds[0]
         footer_text = (embed.get("footer") or {}).get("text", "")
 
-        # Nettoyage automatique des anciens messages de test (format "ID: ...")
         if footer_text.startswith("ID:"):
             delete_message(msg_id)
             continue
@@ -150,8 +148,6 @@ def sync_channel_state(
             continue
 
         is_resolved = bool(match.group("resolved"))
-
-        # Date de création du message Discord (UTC -> Europe/Paris)
         msg_ts = datetime.fromisoformat(msg["timestamp"]).astimezone(TIMEZONE)
 
         if is_resolved:
@@ -161,11 +157,10 @@ def sync_channel_state(
             continue
 
         raw_title = embed.get("title", "")
-        # Extrait "Métro Ligne 1" depuis "🔴 Métro Ligne 1 - Interruption en cours"
         line_name = re.sub(r"^[🔴🟠🟢]\s*", "", raw_title).split(" - ")[0].strip() or "Réseau Ilévia"
         line_fp = compute_fingerprint(line_name, line_name)
 
-        # Un seul message actif par ligne : supprime les doublons plus anciens de la même ligne
+        # Les messages sont lus du plus récent au plus ancien : tout second message d'une même ligne est un doublon.
         if line_fp in open_incidents:
             delete_message(msg_id)
             continue
@@ -205,33 +200,27 @@ def sync_channel_state(
 
 
 def send_ongoing_notification(p: Perturbation, now: datetime | None = None) -> str:
-    """Envoie uniquement l'encadré rouge/orange (sans texte au-dessus)."""
+    """Publie un nouvel Embed d'alerte sur Discord et retourne l'identifiant du message créé."""
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages"
     embed = build_ongoing_embed(p, now=now)
-    payload = {"embeds": [embed]}
-    response = requests.post(url, headers=_headers(), json=payload, timeout=15)
+    response = requests.post(url, headers=_headers(), json={"embeds": [embed]}, timeout=15)
     response.raise_for_status()
     return response.json()["id"]
 
 
 def update_ongoing_message(message_id: str, p: Perturbation, now: datetime | None = None) -> None:
-    """Met à jour silencieusement l'encadré existant tant que l'incident continue."""
+    """Met à jour silencieusement un Embed d'alerte existant sans déclencher de notification push."""
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages/{message_id}"
     embed = build_ongoing_embed(p, now=now)
-    payload = {"embeds": [embed]}
-    response = requests.patch(url, headers=_headers(), json=payload, timeout=15)
+    response = requests.patch(url, headers=_headers(), json={"embeds": [embed]}, timeout=15)
     response.raise_for_status()
 
 
 def resolve_incident(incident: TrackedIncident, now: datetime | None = None) -> str:
-    """
-    1. Supprime l'encadré rouge/orange de l'interruption terminée.
-    2. Envoie un nouvel encadré vert (qui déclenche une notification et s'auto-détruira dans 1h).
-    """
+    """Remplace l'Embed d'alerte par un Embed vert de fin d'interruption."""
     delete_message(incident.message_id)
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages"
     embed = build_resolved_embed(incident, now=now)
-    payload = {"embeds": [embed]}
-    response = requests.post(url, headers=_headers(), json=payload, timeout=15)
+    response = requests.post(url, headers=_headers(), json={"embeds": [embed]}, timeout=15)
     response.raise_for_status()
     return response.json()["id"]

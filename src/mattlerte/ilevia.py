@@ -1,18 +1,20 @@
+"""Collecte, filtrage et normalisation des perturbations Ilévia depuis l'API Open Data MEL."""
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import html
 import re
 import unicodedata
+
 import requests
 
 from mattlerte.config import ILEVIA_PERTURBATIONS_URL, TIMEZONE, WATCHED_LINES
 
-# Deux niveaux d'alerte retenus
-SEVERITY_RED = "RED"        # 🔴 Interruption / Station non desservie
-SEVERITY_ORANGE = "ORANGE"  # 🟠 Trafic ralenti / Perturbé
+SEVERITY_RED = "RED"
+SEVERITY_ORANGE = "ORANGE"
 
-# Mots-clés indiquant une information non-urgente ou une résolution (à ignorer comme nouvelle alerte)
+# Motifs d'annonces commerciales, travaux futurs ou pannes d'équipements à exclure.
 IGNORED_PATTERNS = (
     r"\bdu \d{1,2} au \d{1,2}\b",
     r"\ba partir du \d{1,2}\b",
@@ -25,7 +27,6 @@ IGNORED_PATTERNS = (
     r"\breprise normale\b",
 )
 
-# Mots-clés indiquant une interruption (🔴 Point Rouge)
 RED_KEYWORDS = (
     "interrompu",
     "interruption",
@@ -41,7 +42,6 @@ RED_KEYWORDS = (
     "bus relais",
 )
 
-# Mots-clés indiquant un ralentissement ou trafic perturbé (🟠 Point Orange)
 ORANGE_KEYWORDS = (
     "ralenti",
     "perturbe",
@@ -59,10 +59,12 @@ ORANGE_KEYWORDS = (
 
 @dataclass
 class Perturbation:
+    """Représente l'état consolidé des perturbations actives sur une ligne."""
+
     fingerprint: str
     line_code: str
     line_name: str
-    severity: str  # "RED" ou "ORANGE"
+    severity: str
     message: str
     reason: str
     stations: list[str]
@@ -72,19 +74,23 @@ class Perturbation:
 
     @property
     def severity_emoji(self) -> str:
+        """Retourne l'icône correspondant au niveau de gravité."""
         return "🔴" if self.severity == SEVERITY_RED else "🟠"
 
     @property
     def severity_label(self) -> str:
+        """Retourne l'intitulé court du niveau de gravité."""
         return "Interruption en cours" if self.severity == SEVERITY_RED else "Perturbation en cours"
 
     def format_start_str(self, now: datetime | None = None) -> str:
+        """Formate l'heure de début et le temps écoulé (ex: '13h45 (depuis 1h15)')."""
         if now is None:
             now = datetime.now(TIMEZONE)
         elapsed = format_duration(now - self.start_time)
         return f"{self.start_time.strftime('%Hh%M')} (depuis {elapsed})"
 
     def format_end_str(self, now: datetime | None = None) -> str:
+        """Formate l'heure de fin estimée et le temps restant, ou 'Indéterminée'."""
         if now is None:
             now = datetime.now(TIMEZONE)
         if self.has_known_end_time:
@@ -93,6 +99,7 @@ class Perturbation:
         return "Indéterminée"
 
     def format_date_str(self, now: datetime | None = None) -> str:
+        """Formate la date de début de la perturbation."""
         return format_date_str(self.start_time, now=now)
 
 
@@ -110,7 +117,7 @@ def format_date_str(dt: datetime, now: datetime | None = None) -> str:
 
 
 def format_duration(delta: timedelta) -> str:
-    """Formate un timedelta en texte lisible (ex: '45 min', '1h15')."""
+    """Convertit une durée en format court lisible (ex: '45 min', '1h15', '2h')."""
     total_minutes = max(1, int(delta.total_seconds() // 60))
     hours, minutes = divmod(total_minutes, 60)
     if hours > 0:
@@ -119,7 +126,7 @@ def format_duration(delta: timedelta) -> str:
 
 
 def clean_message(raw_text: str) -> str:
-    """Retire les balises HTML, caractères invisibles et normalise les espaces."""
+    """Supprime le balisage HTML, les caractères invisibles (BOM/ZWSP) et normalise les espaces."""
     text = html.unescape(raw_text or "")
     text = text.replace("\ufeff", "").replace("\u200b", "")
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
@@ -129,7 +136,7 @@ def clean_message(raw_text: str) -> str:
 
 
 def _format_station_name(name: str) -> str:
-    """Nettoie et met en forme proprement le nom d'une station ou d'une section."""
+    """Nettoie et harmonise la casse d'un nom de station ou d'un tronçon."""
     cleaned = re.sub(r"\s*(?:=>|->)\s*report.*$", "", name, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+en direction de\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+jusqu(?:e|['’][aà])\b.*$", "", cleaned, flags=re.IGNORECASE)
@@ -137,18 +144,14 @@ def _format_station_name(name: str) -> str:
     cleaned = re.sub(r"\s*<+>+?\s*", " - ", cleaned)
     cleaned = re.sub(r"\s*/\s*", " / ", cleaned)
     cleaned = cleaned.strip(" .,:;►▶•-")
-    # Si tout est en majuscules (ex: RÉPUBLIQUE BEAUX-ARTS), passe en Title Case plus lisible
     if cleaned.isupper() and len(cleaned) > 3:
         cleaned = cleaned.title()
     return cleaned
 
 
 def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
-    """
-    Extrait la raison de l'incident et la liste des stations non desservies
-    à partir du message brut d'Ilévia en supprimant tout le texte de report.
-    """
-    # 1. Supprime les phrases de report/conseils inutiles
+    """Extrait le motif et la liste des stations non desservies depuis un message Ilévia."""
+    # Remplace les consignes de report par un retour à la ligne pour éviter de coller deux phrases.
     stripped = re.sub(
         r"(?:▶|►|•)?\s*(?:Vous pouvez vous reporter|Retrouvez le plan|Des bus relais sont|Nous vous invitons|Le Tramway circule uniquement|Calculez votre trajet|il[eé]via vous prie)[^.\n]*(?:\.|$)",
         "\n",
@@ -156,7 +159,6 @@ def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
         flags=re.IGNORECASE,
     )
 
-    # 2. Extraction de la Raison ("En raison de / d'une / des ...")
     reason = "Incident d'exploitation"
     reason_match = re.search(
         r"en raison\s+(?:d['’]une?\s+|des\s+|de\s+la\s+|du\s+|de\s+)([^,.\n:]+)",
@@ -177,12 +179,10 @@ def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
         if st and not any(_normalize_for_match(existing) == norm for existing in stations):
             stations.append(st)
 
-    # 3. Cas 1 : Liste à puces explicite (►, ▶, •)
     bullet_matches = re.findall(r"[►▶•]\s*([^\n►▶•]+)", stripped)
     for b in bullet_matches:
         _add_station(b)
 
-    # 4. Cas 2 : "les stations (de métro) X et Y ne sont (actuellement) pas desservies"
     if not stations:
         m_multi = re.search(
             r"les stations(?:\s+de\s+m[eé]tro)?\s+(.+?)\s+ne\s+sont\s+(?:actuellement\s+)?(?:pas|plus)\s+desservi",
@@ -190,11 +190,9 @@ def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
             flags=re.IGNORECASE,
         )
         if m_multi:
-            raw_list = re.split(r"\s+et\s+|,\s*", m_multi.group(1), flags=re.IGNORECASE)
-            for item in raw_list:
+            for item in re.split(r"\s+et\s+|,\s*", m_multi.group(1), flags=re.IGNORECASE):
                 _add_station(item)
 
-    # 5. Cas 3 : "la station X n'est pas desservie" ou "ne desservent pas la station X"
     if not stations:
         m_single = re.search(
             r"(?:ne\s+desservent\s+pas\s+la\s+station|l['’]arr[eê]t\s+|la\s+station\s+)([^,.\n:]+?)(?:\s+n['’]est\s+(?:pas|plus)\s+desservi|\s+en\s+direction|\s*$|\.)",
@@ -204,7 +202,6 @@ def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
         if m_single:
             _add_station(m_single.group(1))
 
-    # 6. Cas 4 : "interrompu entre X et Y" ou "Toute la ligne"
     if not stations:
         between_matches = re.findall(
             r"interrompu[^.\n:]*?\bentre\s+(?:les\s+stations\s*:?\s*)?([^.\n:]+)",
@@ -218,23 +215,19 @@ def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
             _add_station("Toute la ligne")
 
     if not stations:
-        first_sentence = stripped.split(".")[0].strip()
-        _add_station(first_sentence)
+        _add_station(stripped.split(".")[0].strip())
 
     return reason, stations
 
 
 def _normalize_for_match(text: str) -> str:
-    """Supprime les accents et met en minuscules pour faciliter la détection de mots-clés."""
+    """Normalise une chaîne en minuscules sans accents pour les comparaisons insensibles."""
     nfkd = unicodedata.normalize("NFKD", text.lower())
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 def classify_severity(message: str) -> str | None:
-    """
-    Retourne 'RED' (interruption), 'ORANGE' (ralentissement/perturbation),
-    ou None si c'est une prévision/info à ignorer.
-    """
+    """Classifie un message en 'RED', 'ORANGE' ou None s'il doit être ignoré."""
     if "✅" in message:
         return None
 
@@ -254,18 +247,16 @@ def classify_severity(message: str) -> str | None:
 
 
 def compute_fingerprint(line_code: str, cleaned_message: str) -> str:
-    """
-    Crée un identifiant unique court (10 caractères) basé sur la ligne et le texte.
-    Permet de fusionner les doublons créés par l'API Ilévia pour un même incident.
-    """
+    """Génère une empreinte SHA-1 courte (10 caractères) servant d'identifiant de suivi."""
     normalized_msg = _normalize_for_match(cleaned_message)
     payload = f"{line_code}|{normalized_msg}".encode("utf-8")
     return hashlib.sha1(payload).hexdigest()[:10]
 
 
 def parse_ilevia_datetime(iso_str: str | None, fallback: datetime) -> datetime:
-    """
-    Les horodatages de l'API GeoServer MEL sont en heure locale (Europe/Paris) avec un suffixe 'Z'.
+    """Convertit un horodatage ISO de l'API MEL en datetime local (Europe/Paris).
+
+    Le GeoServer MEL ajoute un suffixe 'Z' à des heures qui sont déjà en heure locale de Lille.
     """
     if not iso_str:
         return fallback
@@ -277,10 +268,7 @@ def parse_ilevia_datetime(iso_str: str | None, fallback: datetime) -> datetime:
 
 
 def _is_default_24h_ttl(start_time: datetime, end_time: datetime) -> bool:
-    """
-    Détecte si `heure_fin_prevue` est simplement le TTL automatique de 24h (ou 23h)
-    ajouté par Ilévia quand l'heure de fin réelle est inconnue.
-    """
+    """Détecte si `heure_fin_prevue` correspond au TTL automatique de 24h appliqué par Ilévia."""
     hours_diff = (end_time - start_time).total_seconds() / 3600.0
     same_min_sec = (
         end_time.minute == start_time.minute
@@ -290,7 +278,7 @@ def _is_default_24h_ttl(start_time: datetime, end_time: datetime) -> bool:
 
 
 def _extract_text_end_time(message: str, start_time: datetime) -> datetime | None:
-    """Extrait une heure de fin explicite dans le texte (ex: 'jusque 09h 40 environ')."""
+    """Extrait une heure de fin mentionnée dans le corps du message (ex: 'jusque 09h 40')."""
     m = re.search(r"\bjusqu(?:e|['’][aà])\s*(\d{1,2})\s*h\s*(\d{0,2})\b", message, flags=re.IGNORECASE)
     if not m:
         return None
@@ -305,13 +293,11 @@ def _extract_text_end_time(message: str, start_time: datetime) -> datetime | Non
 
 
 def fetch_active_perturbations(now: datetime | None = None) -> list[Perturbation]:
-    """
-    Interroge l'API de la MEL, filtre sur Métro 1, Métro 2 et Tramway,
-    et fusionne toutes les perturbations actives par ligne (1 message max par ligne).
-    """
+    """Récupère et fusionne par ligne les perturbations actives depuis l'API Open Data MEL."""
     if now is None:
         now = datetime.now(TIMEZONE)
 
+    # Le service Ilévia redémarre vers 04h00 : les alertes sans fin connue de la veille sont expirées.
     service_day_cutoff = (now - timedelta(hours=4)).date()
 
     response = requests.get(
