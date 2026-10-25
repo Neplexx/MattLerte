@@ -1,13 +1,8 @@
 name: Vérification Métro & Tram Ilévia
 
 on:
-  # Permet de lancer manuellement depuis l'onglet "Actions" sur GitHub pour tester
+  # Déclenché toutes les 5 min par cron-job.org (et manuellement depuis l'onglet Actions)
   workflow_dispatch:
-
-  # Exécution automatique toutes les 5 minutes pendant les horaires de service Ilévia
-  # (03h00 à 00h59 UTC, ce qui couvre ~05h00 à 02h00 heure de Paris)
-  schedule:
-    - cron: "*/5 0,3-23 * * *"
 
 jobs:
   check-ilevia:
