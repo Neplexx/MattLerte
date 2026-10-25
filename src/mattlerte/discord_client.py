@@ -9,7 +9,13 @@ from mattlerte.config import (
     RESOLVED_RETENTION_MINUTES,
     TIMEZONE,
 )
-from mattlerte.ilevia import Perturbation, SEVERITY_RED, format_duration
+from mattlerte.ilevia import (
+    Perturbation,
+    SEVERITY_RED,
+    compute_fingerprint,
+    format_date_str,
+    format_duration,
+)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
@@ -23,6 +29,7 @@ FOOTER_REGEX = re.compile(
     r"^réf:\s*(?P<fp>[a-f0-9]+)(?:\s*•\s*(?P<resolved>résolu))?$"
 )
 START_TIME_REGEX = re.compile(r"\*\*Début\s*:\*\*\s*(\d{2})h(\d{2})")
+DATE_REGEX = re.compile(r"\*\*Date\s*:\*\*\s*(\d{2})/(\d{2})")
 
 
 @dataclass
@@ -58,6 +65,7 @@ def build_ongoing_embed(p: Perturbation, now: datetime | None = None) -> dict:
     description = (
         f"**Début :** {p.format_start_str(now=now)}\n"
         f"**Fin estimée :** {p.format_end_str(now=now)}\n"
+        f"**Date :** {p.format_date_str(now=now)}\n"
         f"**Raison :** {p.reason}\n"
         f"**Stations non desservies :**\n{stations_block}"
     )
@@ -82,6 +90,7 @@ def build_resolved_embed(incident: TrackedIncident, now: datetime | None = None)
 
     description = (
         f"**Trafic rétabli :** {end_str}\n"
+        f"**Date :** {format_date_str(incident.start_time, now=now)}\n"
         f"**Durée totale :** {total_duration} (de {start_str} à {end_str})\n"
         f"**Stations rétablies :** {stations_str}"
     )
@@ -155,15 +164,15 @@ def sync_channel_state(
                 recently_resolved_ids.add(fp)
             continue
 
-        # Message d'interruption en cours
-        if fp in open_incidents:
-            # Doublon éventuel : on supprime l'ancien
-            delete_message(msg_id)
-            continue
-
         raw_title = embed.get("title", "")
         # Extrait "Métro Ligne 1" depuis "🔴 Métro Ligne 1 - Interruption en cours"
         line_name = re.sub(r"^[🔴🟠🟢]\s*", "", raw_title).split(" - ")[0].strip() or "Réseau Ilévia"
+        line_fp = compute_fingerprint(line_name, line_name)
+
+        # Un seul message actif par ligne : supprime les doublons plus anciens de la même ligne
+        if line_fp in open_incidents:
+            delete_message(msg_id)
+            continue
 
         raw_desc = embed.get("description", "")
         stations = [
@@ -176,13 +185,18 @@ def sync_channel_state(
         m_start = START_TIME_REGEX.search(raw_desc)
         if m_start:
             h, m = int(m_start.group(1)), int(m_start.group(2))
-            candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if candidate > now + timedelta(minutes=5):
-                candidate -= timedelta(days=1)
+            m_date = DATE_REGEX.search(raw_desc)
+            if m_date:
+                day, month = int(m_date.group(1)), int(m_date.group(2))
+                candidate = now.replace(month=month, day=day, hour=h, minute=m, second=0, microsecond=0)
+            else:
+                candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if candidate > now + timedelta(minutes=5):
+                    candidate -= timedelta(days=1)
             start_dt = candidate
 
-        open_incidents[fp] = TrackedIncident(
-            fingerprint=fp,
+        open_incidents[line_fp] = TrackedIncident(
+            fingerprint=line_fp,
             message_id=msg_id,
             line_name=line_name,
             stations=stations,

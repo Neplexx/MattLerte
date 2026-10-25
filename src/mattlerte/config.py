@@ -28,6 +28,6 @@ WATCHED_LINES: dict[str, str] = {
     "ILEVIA:LineRef::ME2:LOC": "Métro Ligne 2",
     "ILEVIA:LineRef::71:LOC": "Tramway (R / T)",
     "ILEVIA:LineRef::TRAM:LOC": "Tramway (R / T)",
-    "ILEVIA:LineRef::TRAMR:LOC": "Tramway R (Roubaix)",
-    "ILEVIA:LineRef::TRAMT:LOC": "Tramway T (Tourcoing)",
+    "ILEVIA:LineRef::TRAMR:LOC": "Tramway (R / T)",
+    "ILEVIA:LineRef::TRAMT:LOC": "Tramway (R / T)",
 }

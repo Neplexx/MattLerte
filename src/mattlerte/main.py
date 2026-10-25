@@ -33,6 +33,7 @@ def run(dry_run: bool = False) -> None:
                 f"\n{p.severity_emoji} {p.line_name} - {p.severity_label}\n"
                 f"   Début                 : {p.format_start_str(now=now)}\n"
                 f"   Fin estimée           : {p.format_end_str(now=now)}\n"
+                f"   Date                  : {p.format_date_str(now=now)}\n"
                 f"   Raison                : {p.reason}\n"
                 f"   Stations non desservies :\n{stations_str}"
             )

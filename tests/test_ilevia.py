@@ -6,9 +6,11 @@ from mattlerte.ilevia import (
     Perturbation,
     SEVERITY_ORANGE,
     SEVERITY_RED,
+    _extract_text_end_time,
     _is_default_24h_ttl,
     classify_severity,
     clean_message,
+    format_date_str,
     format_duration,
     parse_reason_and_stations,
 )
@@ -68,6 +70,19 @@ def test_format_duration():
     assert format_duration(timedelta(hours=2)) == "2h"
 
 
+def test_format_date_str():
+    now = datetime(2026, 10, 25, 19, 0, 0, tzinfo=TIMEZONE)
+    assert format_date_str(datetime(2026, 10, 25, 9, 0, 0, tzinfo=TIMEZONE), now=now) == "25/10 (Aujourd'hui)"
+    assert format_date_str(datetime(2026, 10, 24, 21, 0, 0, tzinfo=TIMEZONE), now=now) == "24/10 (hier)"
+    assert format_date_str(datetime(2026, 10, 23, 18, 0, 0, tzinfo=TIMEZONE), now=now) == "23/10"
+
+
+def test_extract_text_end_time():
+    start = datetime(2026, 10, 25, 9, 9, 53, tzinfo=TIMEZONE)
+    msg = "La ligne 1 du métro est interrompue entre CHU EURASANTE et REPUBLIQUE BEAUX-ARTS jusque 09h 40 environ."
+    assert _extract_text_end_time(msg, start) == datetime(2026, 10, 25, 9, 40, 0, tzinfo=TIMEZONE)
+
+
 def test_discord_embeds_and_footer_parsing():
     now = datetime(2026, 10, 24, 15, 0, 0, tzinfo=TIMEZONE)
     start = datetime(2026, 10, 24, 13, 45, 0, tzinfo=TIMEZONE)
@@ -89,6 +104,7 @@ def test_discord_embeds_and_footer_parsing():
     ongoing_embed = build_ongoing_embed(p, now=now)
     assert "**Début :** 13h45 (depuis 1h15)" in ongoing_embed["description"]
     assert "**Fin estimée :** 16h00 (reste ~1h)" in ongoing_embed["description"]
+    assert "**Date :** 24/10 (Aujourd'hui)" in ongoing_embed["description"]
     assert "**Raison :** Incident technique" in ongoing_embed["description"]
     assert "**Stations non desservies :**\n• **Quatre Cantons - Gare Lille Flandres**" in ongoing_embed["description"]
 
@@ -106,6 +122,7 @@ def test_discord_embeds_and_footer_parsing():
     )
     resolved_embed = build_resolved_embed(tracked, now=now)
     assert "Fin de l'interruption" in resolved_embed["title"]
+    assert "**Date :** 24/10 (Aujourd'hui)" in resolved_embed["description"]
     assert "1h15" in resolved_embed["description"]
     match_res = FOOTER_REGEX.match(resolved_embed["footer"]["text"])
     assert match_res is not None
