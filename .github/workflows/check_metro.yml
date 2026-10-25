@@ -4,6 +4,10 @@ on:
   # Déclenché toutes les 5 min par cron-job.org (et manuellement depuis l'onglet Actions)
   workflow_dispatch:
 
+concurrency:
+  group: check-ilevia
+  cancel-in-progress: false
+
 jobs:
   check-ilevia:
     runs-on: ubuntu-24.04

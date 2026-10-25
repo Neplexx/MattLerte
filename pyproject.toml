@@ -1,7 +1,7 @@
 [project]
 name = "mattlerte"
 version = "0.1.0"
-description = "Add your description here"
+description = "Alertes Discord en temps réel pour les perturbations Métro & Tram Ilévia (Lille)"
 readme = "README.md"
 authors = [
     { name = "Mattéo DETALLE", email = "matteo.detalle@student.junia.com" }

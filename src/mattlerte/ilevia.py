@@ -349,7 +349,7 @@ def fetch_active_perturbations(now: datetime | None = None) -> list[Perturbation
                 end_time = text_end
                 has_known_end = True
 
-        if end_time <= now or start_time.date() < service_day_cutoff:
+        if end_time <= now or (not has_known_end and start_time.date() < service_day_cutoff):
             continue
 
         line_name = WATCHED_LINES[line_code]

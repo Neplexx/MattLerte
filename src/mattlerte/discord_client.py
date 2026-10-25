@@ -114,12 +114,12 @@ def delete_message(message_id: str) -> None:
 def sync_channel_state(
     now: datetime | None = None,
     limit: int = 50,
-) -> tuple[dict[str, TrackedIncident], set[str]]:
+) -> dict[str, TrackedIncident]:
     """
     Parcourt les derniers messages du salon Discord :
     1. Supprime automatiquement les messages verts 'résolu' vieux de plus d'1h (RESOLVED_RETENTION_MINUTES).
-    2. Supprime les anciens messages d'une version précédente du format (ID: ...).
-    3. Retourne ({fingerprint: TrackedIncident} des pannes en cours, {fingerprints} déjà résolus récemment).
+    2. Supprime les anciens messages d'une version précédente ou doublons d'une même ligne.
+    3. Retourne {fingerprint: TrackedIncident} des pannes actuellement affichées.
     """
     if now is None:
         now = datetime.now(TIMEZONE)
@@ -130,7 +130,6 @@ def sync_channel_state(
     messages = response.json()
 
     open_incidents: dict[str, TrackedIncident] = {}
-    recently_resolved_ids: set[str] = set()
 
     for msg in messages:
         msg_id = msg["id"]
@@ -150,7 +149,6 @@ def sync_channel_state(
         if not match:
             continue
 
-        fp = match.group("fp")
         is_resolved = bool(match.group("resolved"))
 
         # Date de création du message Discord (UTC -> Europe/Paris)
@@ -160,8 +158,6 @@ def sync_channel_state(
             age_minutes = (now - msg_ts).total_seconds() / 60.0
             if age_minutes >= RESOLVED_RETENTION_MINUTES:
                 delete_message(msg_id)
-            else:
-                recently_resolved_ids.add(fp)
             continue
 
         raw_title = embed.get("title", "")
@@ -189,6 +185,8 @@ def sync_channel_state(
             if m_date:
                 day, month = int(m_date.group(1)), int(m_date.group(2))
                 candidate = now.replace(month=month, day=day, hour=h, minute=m, second=0, microsecond=0)
+                if candidate > now + timedelta(minutes=5):
+                    candidate = candidate.replace(year=now.year - 1)
             else:
                 candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if candidate > now + timedelta(minutes=5):
@@ -203,7 +201,7 @@ def sync_channel_state(
             start_time=start_dt,
         )
 
-    return open_incidents, recently_resolved_ids
+    return open_incidents
 
 
 def send_ongoing_notification(p: Perturbation, now: datetime | None = None) -> str:

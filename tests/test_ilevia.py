@@ -10,6 +10,7 @@ from mattlerte.ilevia import (
     _is_default_24h_ttl,
     classify_severity,
     clean_message,
+    fetch_active_perturbations,
     format_date_str,
     format_duration,
     parse_reason_and_stations,
@@ -127,3 +128,45 @@ def test_discord_embeds_and_footer_parsing():
     match_res = FOOTER_REGEX.match(resolved_embed["footer"]["text"])
     assert match_res is not None
     assert match_res.group("resolved") == "résolu"
+
+
+def test_fetch_active_perturbations_merges_per_line(monkeypatch):
+    now = datetime(2026, 10, 25, 19, 0, 0, tzinfo=TIMEZONE)
+
+    fake_payload = {
+        "features": [
+            {
+                "properties": {
+                    "cible": "ILEVIA:LineRef::71:LOC",
+                    "date_modification": "2026-10-24T22:15:00Z",
+                    "heure_fin_prevue": "2026-10-25T23:00:00Z",
+                    "message": "En raison des dégâts météo, le trafic Tramway est interrompu entre ► Foch <> Tourcoing Centre",
+                }
+            },
+            {
+                "properties": {
+                    "cible": "ILEVIA:LineRef::TRAMR:LOC",
+                    "date_modification": "2026-10-25T10:30:00Z",
+                    "heure_fin_prevue": "2026-10-26T01:00:00Z",
+                    "message": "En raison de l'intervention sur la caténaire, le trafic Tramway est interrompu entre Brossolette <> Roubaix Eurotéléport",
+                }
+            },
+        ]
+    }
+
+    class DummyResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return fake_payload
+
+    monkeypatch.setattr("mattlerte.ilevia.requests.get", lambda *a, **kw: DummyResponse())
+
+    results = fetch_active_perturbations(now=now)
+    assert len(results) == 1
+    tram = results[0]
+    assert tram.line_name == "Tramway (R / T)"
+    assert tram.format_date_str(now=now) == "24/10 (hier)"
+    assert "Dégâts météo / Intervention sur la caténaire" == tram.reason
+    assert tram.stations == ["Foch - Tourcoing Centre", "Brossolette - Roubaix Eurotéléport"]

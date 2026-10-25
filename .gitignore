@@ -11,3 +11,5 @@ wheels/
 .env
 .pytest_cache/
 .vscode/
+AUDIT.txt
+audit.txt

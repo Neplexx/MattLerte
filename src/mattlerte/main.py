@@ -39,7 +39,7 @@ def run(dry_run: bool = False) -> None:
             )
         return
 
-    open_incidents, _ = sync_channel_state(now=now)
+    open_incidents = sync_channel_state(now=now)
     print(f"-> {len(open_incidents)} incident(s) actuellement affiché(s) dans le salon Discord.")
 
     # 1. Nouvelles perturbations ou mises à jour des perturbations toujours en cours
