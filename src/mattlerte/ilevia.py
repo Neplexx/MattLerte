@@ -8,52 +8,98 @@ import re
 import unicodedata
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from mattlerte.config import ILEVIA_PERTURBATIONS_URL, TIMEZONE, WATCHED_LINES
+
+_ORIGINAL_REQUESTS_GET = requests.get
 
 SEVERITY_RED = "RED"
 SEVERITY_ORANGE = "ORANGE"
 
-# Motifs d'annonces commerciales, travaux futurs ou pannes d'équipements à exclure.
+NEGATION_PATTERN = re.compile(
+    r"\b(?:aucune?|sans)\s+(?:perturbation|interruption|incident)s?\b"
+    r"|\bpas\s+d(?:e\s+|['’]\s*)(?:perturbation|interruption|incident)s?\b"
+)
+
+# Motifs d'annonces commerciales ou pannes d'équipements à exclure inconditionnellement.
 IGNORED_PATTERNS = (
-    r"\bdu \d{1,2} au \d{1,2}\b",
-    r"\ba partir du \d{1,2}\b",
     r"\brenforce son offre\b",
     r"\bdistributeurs? automatiques?\b",
     r"\bvalideurs?\b",
     r"\barmoires techniques\b",
     r"evolution\s*:\s*realisation",
-    r"\btrafic retabli\b",
-    r"\breprise normale\b",
 )
 
+END_OF_PERTURBATION_PATTERN = re.compile(
+    r"\b(?:trafic\s+retabli|reprise\s+normale|fin\s+de\s+perturbation|trafic\s+normal|retabli|termine|reprise)\b"
+)
+
+RESTRICTION_CLAUSE_PATTERN = re.compile(
+    r"\b(?:mais|cependant|toutefois|reste|sauf)\b"
+)
+
+CLOSED_STATION_PATTERN = re.compile(
+    r"\b(?:stations?\s+fermees?|non\s+desservi(?:e|es|s)?|pas\s+desservi(?:e|es|s)?|plus\s+desservi(?:e|es|s)?)\b"
+)
+
+DATE_RANGE_PATTERN = re.compile(r"\bdu\s+\d{1,2}\b")
+FUTURE_SCHEDULE_PATTERN = re.compile(r"\b(?:a\s+partir\s+du|prochainement)\b")
+IMMEDIATE_INDICATOR_PATTERN = re.compile(r"\b(?:actuellement|en\s+ce\s+moment|immediatement|en\s+cours)\b")
+FUTURE_TENSE_PATTERN = re.compile(r"\b(?:sera|seront|aura\s+lieu|auront\s+lieu|va\s+etre|vont\s+etre)\b")
+
 RED_KEYWORDS = (
+    "trafic suspendu",
+    "suspendu",
+    "coupure",
     "interrompu",
     "interruption",
+    "bloque",
+    "bloquee",
     "ne circule pas",
     "ne circulent pas",
     "a l'arret",
     "pas desservi",
     "plus desservi",
+    "non desservi",
+    "non desservie",
+    "non desservis",
+    "non desservies",
     "station fermee",
     "stations fermees",
-    "devie",
-    "deviation",
+    "fermeture",
+    "accident",
+    "colis suspect",
+    "malaise",
     "bus relais",
 )
 
 ORANGE_KEYWORDS = (
-    "ralenti",
     "perturbe",
     "perturbation",
+    "ralenti",
+    "ralentissement",
     "retard",
+    "irregulier",
     "temps d'attente",
     "intervalle",
     "incident",
     "panne",
+    "ascenseur",
+    "travaux",
     "intervention",
+    "devie",
+    "deviation",
     "ne sont pas realises",
     "n'est pas realise",
+)
+
+RED_KEYWORD_PATTERNS = tuple(
+    re.compile(rf"\b{re.escape(kw)}(?:e|es|s)?\b") for kw in RED_KEYWORDS
+)
+ORANGE_KEYWORD_PATTERNS = tuple(
+    re.compile(rf"\b{re.escape(kw)}(?:e|es|s)?\b") for kw in ORANGE_KEYWORDS
 )
 
 
@@ -179,9 +225,13 @@ def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
         if st and not any(_normalize_for_match(existing) == norm for existing in stations):
             stations.append(st)
 
+    non_station_bullet_re = re.compile(
+        r"^(?:des\s+bus\s+relais|bus\s+relais|navette|plus\s+d['’]info|info|report|voir|retrouvez|calculez|le\s+tramway\s+circule|nous\s+vous)"
+    )
     bullet_matches = re.findall(r"[►▶•]\s*([^\n►▶•]+)", stripped)
     for b in bullet_matches:
-        _add_station(b)
+        if not non_station_bullet_re.match(_normalize_for_match(b.strip())):
+            _add_station(b)
 
     if not stations:
         m_multi = re.search(
@@ -215,7 +265,18 @@ def parse_reason_and_stations(message: str) -> tuple[str, list[str]]:
             _add_station("Toute la ligne")
 
     if not stations:
-        _add_station(stripped.split(".")[0].strip())
+        first_sentence = _format_station_name(stripped.split(".")[0].strip())
+        if (
+            not first_sentence
+            or len(first_sentence) > 70
+            or re.search(
+                r"\b(?:trafic|perturbe|ralenti|incident|panne|travaux|retard|circulation|ligne)\b",
+                _normalize_for_match(first_sentence),
+            )
+        ):
+            _add_station("Toute la ligne")
+        else:
+            _add_station(first_sentence)
 
     return reason, stations
 
@@ -226,6 +287,11 @@ def _normalize_for_match(text: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
+def _matches_any(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
+    """Vérifie si au moins un motif regex correspond dans le texte normalisé."""
+    return any(p.search(text) for p in patterns)
+
+
 def classify_severity(message: str) -> str | None:
     """Classifie un message en 'RED', 'ORANGE' ou None s'il doit être ignoré."""
     if "✅" in message:
@@ -233,14 +299,50 @@ def classify_severity(message: str) -> str | None:
 
     normalized = _normalize_for_match(message)
 
+    if NEGATION_PATTERN.search(normalized):
+        return None
+
     for pattern in IGNORED_PATTERNS:
         if re.search(pattern, normalized):
             return None
 
-    if any(keyword in normalized for keyword in RED_KEYWORDS):
+    if END_OF_PERTURBATION_PATTERN.search(normalized):
+        restriction_match = RESTRICTION_CLAUSE_PATTERN.search(normalized)
+        restriction_tail = normalized[restriction_match.start():] if restriction_match else ""
+        has_tail_alert = bool(restriction_tail) and (
+            _matches_any(RED_KEYWORD_PATTERNS, restriction_tail)
+            or _matches_any(ORANGE_KEYWORD_PATTERNS, restriction_tail)
+        )
+        has_closed_station = bool(CLOSED_STATION_PATTERN.search(normalized))
+        if not (has_tail_alert or has_closed_station):
+            return None
+        target_text = restriction_tail if has_tail_alert else normalized
+        if _matches_any(RED_KEYWORD_PATTERNS, target_text):
+            return SEVERITY_RED
+        if _matches_any(ORANGE_KEYWORD_PATTERNS, target_text):
+            return SEVERITY_ORANGE
+        return None
+
+    if DATE_RANGE_PATTERN.search(normalized):
+        has_immediate_red = (
+            _matches_any(RED_KEYWORD_PATTERNS, normalized)
+            and not FUTURE_TENSE_PATTERN.search(normalized)
+        )
+        if not has_immediate_red:
+            return None
+
+    if FUTURE_SCHEDULE_PATTERN.search(normalized):
+        has_immediate_red = (
+            _matches_any(RED_KEYWORD_PATTERNS, normalized)
+            and bool(IMMEDIATE_INDICATOR_PATTERN.search(normalized))
+        )
+        if not has_immediate_red:
+            return None
+
+    if _matches_any(RED_KEYWORD_PATTERNS, normalized):
         return SEVERITY_RED
 
-    if any(keyword in normalized for keyword in ORANGE_KEYWORDS):
+    if _matches_any(ORANGE_KEYWORD_PATTERNS, normalized):
         return SEVERITY_ORANGE
 
     return None
@@ -253,31 +355,55 @@ def compute_fingerprint(line_code: str, cleaned_message: str) -> str:
     return hashlib.sha1(payload).hexdigest()[:10]
 
 
-def parse_ilevia_datetime(iso_str: str | None, fallback: datetime) -> datetime:
+def parse_ilevia_datetime(iso_str: str | None, fallback: datetime | None = None) -> datetime:
     """Convertit un horodatage ISO de l'API MEL en datetime local (Europe/Paris).
 
-    Le GeoServer MEL ajoute un suffixe 'Z' à des heures qui sont déjà en heure locale de Lille.
+    Le GeoServer MEL ajoute un suffixe 'Z' à des heures déjà en heure locale de Lille.
+    Les offsets explicites (+01:00, +02:00, etc.) sont en revanche convertis vers Europe/Paris.
     """
     if not iso_str:
-        return fallback
-    clean_iso = iso_str.rstrip("Z")
-    if "+" in clean_iso:
-        clean_iso = clean_iso.split("+")[0]
-    dt_naive = datetime.fromisoformat(clean_iso)
-    return dt_naive.replace(tzinfo=TIMEZONE)
+        return fallback if fallback is not None else datetime.now(TIMEZONE)
+    raw = iso_str.strip()
+    if raw.endswith("Z"):
+        dt_naive = datetime.fromisoformat(raw.rstrip("Z"))
+        return dt_naive.replace(tzinfo=TIMEZONE)
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is not None:
+        return dt.astimezone(TIMEZONE)
+    return dt.replace(tzinfo=TIMEZONE)
 
 
-def _is_default_24h_ttl(start_time: datetime, end_time: datetime) -> bool:
+def _is_ttl_diff(hours_diff: float) -> bool:
+    """Retourne True si l'écart en heures correspond à 23h, 24h ou 25h (±5 min, gère le DST)."""
+    nearest_hour = round(hours_diff)
+    return nearest_hour in (23, 24, 25) and abs(hours_diff - nearest_hour) * 60 <= 5
+
+
+def _is_default_24h_ttl(
+    start_time: datetime,
+    end_time: datetime,
+    props: dict | None = None,
+) -> bool:
     """Détecte si `heure_fin_prevue` correspond au TTL automatique de 24h appliqué par Ilévia."""
     hours_diff = (end_time - start_time).total_seconds() / 3600.0
-    same_min_sec = (
-        end_time.minute == start_time.minute
-        and abs(end_time.second - start_time.second) <= 2
-    )
-    return 22.5 <= hours_diff <= 25.5 and same_min_sec
+    if _is_ttl_diff(hours_diff):
+        return True
+    if props:
+        for key in ("date_debut", "date_creation"):
+            raw_ref = props.get(key)
+            if raw_ref:
+                ref_dt = parse_ilevia_datetime(raw_ref, fallback=start_time)
+                ref_diff = (end_time - ref_dt).total_seconds() / 3600.0
+                if _is_ttl_diff(ref_diff):
+                    return True
+    return False
 
 
-def _extract_text_end_time(message: str, start_time: datetime) -> datetime | None:
+def _extract_text_end_time(
+    message: str,
+    start_time: datetime,
+    now: datetime | None = None,
+) -> datetime | None:
     """Extrait une heure de fin mentionnée dans le corps du message (ex: 'jusque 09h 40')."""
     m = re.search(r"\bjusqu(?:e|['’][aà])\s*(\d{1,2})\s*h\s*(\d{0,2})\b", message, flags=re.IGNORECASE)
     if not m:
@@ -287,9 +413,25 @@ def _extract_text_end_time(message: str, start_time: datetime) -> datetime | Non
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
     candidate = start_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate < start_time - timedelta(minutes=15):
+    if start_time.hour >= 18 and candidate.hour <= 6:
         candidate += timedelta(days=1)
+    if now is not None and candidate <= now:
+        return None
     return candidate
+
+
+def _create_http_session() -> requests.Session:
+    """Crée une session HTTP avec politique de retry sur les erreurs transitoires."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def fetch_active_perturbations(now: datetime | None = None) -> list[Perturbation]:
@@ -297,20 +439,48 @@ def fetch_active_perturbations(now: datetime | None = None) -> list[Perturbation
     if now is None:
         now = datetime.now(TIMEZONE)
 
-    # Le service Ilévia redémarre vers 04h00 : les alertes sans fin connue de la veille sont expirées.
+    # Le service Ilévia redémarre vers 04h00 : les alertes sans fin connue de la veille sont expirées,
+    # sauf les incidents nocturnes démarrés il y a moins de 8 heures.
     service_day_cutoff = (now - timedelta(hours=4)).date()
 
-    response = requests.get(
-        ILEVIA_PERTURBATIONS_URL,
-        headers={"User-Agent": "MattLerte/1.0"},
-        timeout=15,
-    )
-    response.raise_for_status()
-    data = response.json()
+    use_patched_get = requests.get is not _ORIGINAL_REQUESTS_GET
+    session = None if use_patched_get else _create_http_session()
+
+    all_features: list[dict] = []
+    next_url: str | None = ILEVIA_PERTURBATIONS_URL
+    pages_fetched = 0
+    max_pages = 5
+
+    while next_url and pages_fetched < max_pages:
+        if use_patched_get:
+            response = requests.get(
+                next_url,
+                headers={"User-Agent": "MattLerte/1.0"},
+                timeout=15,
+            )
+        else:
+            assert session is not None
+            response = session.get(
+                next_url,
+                headers={"User-Agent": "MattLerte/1.0"},
+                timeout=15,
+            )
+        response.raise_for_status()
+        data = response.json()
+        features = data.get("features", [])
+        all_features.extend(features)
+        pages_fetched += 1
+
+        next_url = None
+        if len(features) == 200:
+            for link in data.get("links", []):
+                if link.get("rel") == "next" and link.get("href"):
+                    next_url = link["href"]
+                    break
 
     deduped: dict[str, Perturbation] = {}
 
-    for feature in data.get("features", []):
+    for feature in all_features:
         props = feature.get("properties") or {}
         line_code = props.get("cible", "")
 
@@ -326,16 +496,26 @@ def fetch_active_perturbations(now: datetime | None = None) -> list[Perturbation
             continue
 
         start_time = parse_ilevia_datetime(props.get("date_modification"), fallback=now)
-        end_time = parse_ilevia_datetime(props.get("heure_fin_prevue"), fallback=now)
-        has_known_end = not _is_default_24h_ttl(start_time, end_time)
+        raw_end = props.get("heure_fin_prevue")
+        if not raw_end:
+            has_known_end = False
+            end_time = now + timedelta(hours=2)
+        else:
+            end_time = parse_ilevia_datetime(raw_end, fallback=now + timedelta(hours=2))
+            has_known_end = not _is_default_24h_ttl(start_time, end_time, props=props)
 
         if not has_known_end:
-            text_end = _extract_text_end_time(message, start_time)
+            text_end = _extract_text_end_time(message, start_time, now=now)
             if text_end is not None:
                 end_time = text_end
                 has_known_end = True
 
-        if end_time <= now or (not has_known_end and start_time.date() < service_day_cutoff):
+        is_stale_no_end = (
+            not has_known_end
+            and start_time.date() < service_day_cutoff
+            and (now - start_time).total_seconds() >= 8 * 3600
+        )
+        if end_time <= now or is_stale_no_end:
             continue
 
         line_name = WATCHED_LINES[line_code]
@@ -347,15 +527,8 @@ def fetch_active_perturbations(now: datetime | None = None) -> list[Perturbation
             if severity == SEVERITY_RED:
                 existing.severity = SEVERITY_RED
             existing.start_time = min(existing.start_time, start_time)
-
-            if has_known_end:
-                if existing.has_known_end_time:
-                    existing.end_time = max(existing.end_time, end_time)
-                else:
-                    existing.end_time = end_time
-                    existing.has_known_end_time = True
-            elif not existing.has_known_end_time:
-                existing.end_time = max(existing.end_time, end_time)
+            existing.has_known_end_time = existing.has_known_end_time and has_known_end
+            existing.end_time = max(existing.end_time, end_time)
 
             existing_reasons = [_normalize_for_match(r) for r in existing.reason.split(" / ")]
             if _normalize_for_match(reason) not in existing_reasons:

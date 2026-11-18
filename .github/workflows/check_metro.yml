@@ -8,6 +8,9 @@ concurrency:
   group: check-ilevia
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   check-ilevia:
     runs-on: ubuntu-24.04
@@ -15,7 +18,7 @@ jobs:
 
     steps:
       - name: Récupération du dépôt
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Installation de uv
         uses: astral-sh/setup-uv@v7

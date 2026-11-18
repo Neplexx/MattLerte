@@ -6,18 +6,27 @@ import sys
 
 from mattlerte.config import DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, TIMEZONE
 from mattlerte.discord_client import (
+    delete_message,
     resolve_incident,
     send_ongoing_notification,
     sync_channel_state,
     update_ongoing_message,
 )
-from mattlerte.ilevia import fetch_active_perturbations
+from mattlerte.ilevia import SEVERITY_ORANGE, SEVERITY_RED, fetch_active_perturbations
 
 
 def run(dry_run: bool = False) -> None:
     """Exécute un cycle complet de vérification Ilévia et de mise à jour du salon Discord."""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+
+    if not dry_run and (not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID):
+        print(
+            "ERREUR : DISCORD_BOT_TOKEN ou DISCORD_CHANNEL_ID manquant. "
+            "Utilisez --dry-run pour un aperçu local sans Discord.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     now = datetime.now(TIMEZONE)
     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Vérification des perturbations Ilévia (Métro & Tram)...")
@@ -27,9 +36,7 @@ def run(dry_run: bool = False) -> None:
 
     print(f"-> {len(active_perturbations)} perturbation(s) active(s) détectée(s) sur l'API MEL.")
 
-    if dry_run or not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
-        if not dry_run:
-            print("⚠️ DISCORD_BOT_TOKEN ou DISCORD_CHANNEL_ID manquant : passage en mode aperçu (--dry-run).")
+    if dry_run:
         for p in active_perturbations:
             stations_str = "\n".join(f"   • {s}" for s in p.stations)
             print(
@@ -53,8 +60,13 @@ def run(dry_run: bool = False) -> None:
             tracked = open_incidents[fp]
             if tracked.start_time < p.start_time:
                 p.start_time = tracked.start_time
-            print(f"[EN COURS] Mise à jour de la durée pour {p.line_name} (réf: {fp})...")
-            update_ongoing_message(tracked.message_id, p, now=now)
+            if tracked.severity == SEVERITY_ORANGE and p.severity == SEVERITY_RED:
+                print(f"[ESCALADE] {p.line_name} (ORANGE -> RED, réf: {fp}) : nouvelle notification...")
+                send_ongoing_notification(p, now=now)
+                delete_message(tracked.message_id)
+            else:
+                print(f"[EN COURS] Mise à jour de la durée pour {p.line_name} (réf: {fp})...")
+                update_ongoing_message(tracked.message_id, p, now=now)
 
     for fp, tracked in open_incidents.items():
         if fp not in active_by_fp:

@@ -20,7 +20,7 @@ ILEVIA_PERTURBATIONS_URL = (
     "collections/dsp_ilevia:perturbations/items?f=application/json&limit=200"
 )
 
-# Correspondance entre les identifiants GTFS/SIRI Ilévia et les 3 groupes affichés sur Discord.
+# Correspondance entre les identifiants GTFS/SIRI Ilévia et les groupes affichés sur Discord.
 WATCHED_LINES: dict[str, str] = {
     "ILEVIA:LineRef::ME1:LOC": "Métro Ligne 1",
     "ILEVIA:LineRef::ME2:LOC": "Métro Ligne 2",
@@ -28,4 +28,7 @@ WATCHED_LINES: dict[str, str] = {
     "ILEVIA:LineRef::TRAM:LOC": "Tramway (R / T)",
     "ILEVIA:LineRef::TRAMR:LOC": "Tramway (R / T)",
     "ILEVIA:LineRef::TRAMT:LOC": "Tramway (R / T)",
+    "TRAMWAY": "Tramway R / T",
+    "TRAM R": "Tramway R",
+    "TRAM T": "Tramway T",
 }

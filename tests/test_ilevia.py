@@ -20,6 +20,7 @@ from mattlerte.ilevia import (
     fetch_active_perturbations,
     format_date_str,
     format_duration,
+    parse_ilevia_datetime,
     parse_reason_and_stations,
 )
 
@@ -177,3 +178,194 @@ def test_fetch_active_perturbations_merges_per_line(monkeypatch):
     assert tram.format_date_str(now=now) == "24/10 (hier)"
     assert tram.reason == "Dégâts météo / Intervention sur la caténaire"
     assert tram.stations == ["Foch - Tourcoing Centre", "Brossolette - Roubaix Eurotéléport"]
+
+
+def test_classify_severity_negations_boundaries_and_active_exceptions():
+    # Négations explicites
+    assert classify_severity("Aucune perturbation en cours sur la ligne 1.") is None
+    assert classify_severity("Il n'y a pas d'interruption de trafic.") is None
+
+    # Bornes \b : "deviendra" ne doit pas matcher "devie", "dépannage" ne doit pas matcher "panne"
+    assert classify_severity("Cette station deviendra accessible demain.") is None
+    assert classify_severity("Opération de dépannage prévue la semaine prochaine.") is None
+
+    # Nouveaux mots-clés RED
+    assert classify_severity("Le trafic est suspendu sur la ligne 2.") == SEVERITY_RED
+    assert classify_severity("La station GAMBETTA est non desservie.") == SEVERITY_RED
+
+    # Fin de perturbation avec clause restrictive active
+    assert (
+        classify_severity(
+            "Le trafic est rétabli sur la ligne 1, mais la station RIHOUR reste non desservie."
+        )
+        == SEVERITY_RED
+    )
+    assert (
+        classify_severity(
+            "Fin de perturbation sur le métro, toutefois le trafic reste ralenti."
+        )
+        == SEVERITY_ORANGE
+    )
+    assert classify_severity("Le trafic est rétabli sur l'ensemble de la ligne 1.") is None
+
+
+def test_extract_text_end_time_expired_and_midnight():
+    # Heure texte déjà dépassée par rapport à `now` -> None
+    start = datetime(2026, 10, 25, 9, 0, tzinfo=TIMEZONE)
+    now_after = datetime(2026, 10, 25, 10, 0, tzinfo=TIMEZONE)
+    msg = "Le trafic est interrompu jusque 09h40 environ."
+    assert _extract_text_end_time(msg, start, now=now_after) is None
+
+    # Passage minuit : début le soir (>= 18h), fin tôt le matin (<= 6h)
+    evening_start = datetime(2026, 10, 25, 22, 30, tzinfo=TIMEZONE)
+    now_evening = datetime(2026, 10, 25, 23, 0, tzinfo=TIMEZONE)
+    msg_midnight = "Interruption du trafic jusqu'à 01h30."
+    assert _extract_text_end_time(msg_midnight, evening_start, now=now_evening) == datetime(
+        2026, 10, 26, 1, 30, tzinfo=TIMEZONE
+    )
+
+
+def test_parse_reason_and_stations_ignores_non_station_bullet():
+    msg = (
+        "En raison d'un incident technique, la station RIHOUR n'est pas desservie.\n"
+        "► Bus relais mis en place entre Gambetta et Gare Lille Flandres."
+    )
+    reason, stations = parse_reason_and_stations(msg)
+    assert reason == "Incident technique"
+    assert stations == ["Rihour"]
+
+
+def test_fetch_active_perturbations_none_end_time_and_nocturnal_cutoff(monkeypatch):
+    # À 05h00, un incident nocturne sans fin connue démarré à 02h00 (< 8h) doit être conservé
+    now = datetime(2026, 10, 25, 5, 0, tzinfo=TIMEZONE)
+    fake_payload = {
+        "features": [
+            {
+                "properties": {
+                    "cible": "ILEVIA:LineRef::ME1:LOC",
+                    "date_modification": "2026-10-25T01:00:00Z",  # 02:00 CET (après changement d'heure)
+                    "heure_fin_prevue": None,
+                    "message": "En raison d'un incident technique, la station RIHOUR n'est pas desservie.",
+                }
+            }
+        ]
+    }
+
+    class DummyResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return fake_payload
+
+    monkeypatch.setattr("mattlerte.ilevia.requests.get", lambda *a, **kw: DummyResponse())
+    results = fetch_active_perturbations(now=now)
+    assert len(results) == 1
+    assert results[0].has_known_end_time is False
+    assert results[0].end_time == now + timedelta(hours=2)
+
+
+def test_fetch_active_perturbations_merges_unknown_end_time(monkeypatch):
+    now = datetime(2026, 10, 25, 15, 0, tzinfo=TIMEZONE)
+    fake_payload = {
+        "features": [
+            {
+                "properties": {
+                    "cible": "ILEVIA:LineRef::ME1:LOC",
+                    "date_modification": "2026-10-25T13:00:00Z",
+                    "heure_fin_prevue": None,
+                    "message": "En raison d'un incident technique, la station RIHOUR n'est pas desservie.",
+                }
+            },
+            {
+                "properties": {
+                    "cible": "ILEVIA:LineRef::ME1:LOC",
+                    "date_modification": "2026-10-25T13:30:00Z",
+                    "heure_fin_prevue": "2026-10-25T16:00:00Z",
+                    "message": "En raison d'un malaise voyageur, la station GAMBETTA n'est pas desservie.",
+                }
+            },
+        ]
+    }
+
+    class DummyResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return fake_payload
+
+    monkeypatch.setattr("mattlerte.ilevia.requests.get", lambda *a, **kw: DummyResponse())
+    results = fetch_active_perturbations(now=now)
+    assert len(results) == 1
+    assert results[0].has_known_end_time is False
+
+
+def test_fetch_active_perturbations_ogc_pagination(monkeypatch):
+    now = datetime(2026, 10, 25, 15, 0, tzinfo=TIMEZONE)
+
+    filler_feature = {
+        "properties": {
+            "cible": "ILEVIA:LineRef::BUS99:LOC",
+            "date_modification": "2026-10-25T13:00:00Z",
+            "heure_fin_prevue": "2026-10-25T16:00:00Z",
+            "message": "Bus dévié.",
+        }
+    }
+    page1 = {
+        "features": [filler_feature] * 200,
+        "links": [{"rel": "next", "href": "https://example.org/items?offset=200"}],
+    }
+    page2 = {
+        "features": [
+            {
+                "properties": {
+                    "cible": "ILEVIA:LineRef::ME2:LOC",
+                    "date_modification": "2026-10-25T13:30:00Z",
+                    "heure_fin_prevue": "2026-10-25T16:30:00Z",
+                    "message": "En raison d'un colis suspect, la station LOMME n'est pas desservie.",
+                }
+            }
+        ],
+        "links": [],
+    }
+
+    called_urls: list[str] = []
+
+    class DummyResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        called_urls.append(url)
+        if "offset=200" in url:
+            return DummyResponse(page2)
+        return DummyResponse(page1)
+
+    monkeypatch.setattr("mattlerte.ilevia.requests.get", fake_get)
+    results = fetch_active_perturbations(now=now)
+    assert len(called_urls) == 2
+    assert called_urls[1] == "https://example.org/items?offset=200"
+    assert len(results) == 1
+    assert results[0].line_name == "Métro Ligne 2"
+
+
+def test_parse_ilevia_datetime_fake_z_and_explicit_offset():
+    # Faux suffixe Z traité comme heure locale Europe/Paris
+    dt_z = parse_ilevia_datetime("2026-10-24T22:15:00Z")
+    assert dt_z == datetime(2026, 10, 24, 22, 15, tzinfo=TIMEZONE)
+
+    # Offset explicite (+02:00 / +00:00) converti vers Europe/Paris
+    dt_offset = parse_ilevia_datetime("2026-10-24T20:15:00+00:00")
+    assert dt_offset == datetime(2026, 10, 24, 22, 15, tzinfo=TIMEZONE)
+
+    dt_paris_offset = parse_ilevia_datetime("2026-10-24T22:15:00+02:00")
+    assert dt_paris_offset == datetime(2026, 10, 24, 22, 15, tzinfo=TIMEZONE)
+
+

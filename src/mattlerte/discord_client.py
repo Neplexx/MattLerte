@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import re
+import time
 
 import requests
 
@@ -14,6 +15,7 @@ from mattlerte.config import (
 )
 from mattlerte.ilevia import (
     Perturbation,
+    SEVERITY_ORANGE,
     SEVERITY_RED,
     compute_fingerprint,
     format_date_str,
@@ -42,6 +44,7 @@ class TrackedIncident:
     line_name: str
     stations: list[str]
     start_time: datetime
+    severity: str = SEVERITY_RED
 
 
 def _headers() -> dict[str, str]:
@@ -55,6 +58,45 @@ def _headers() -> dict[str, str]:
         "Content-Type": "application/json",
         "User-Agent": "MattLerte (https://github.com/Neplexx/MattLerte, 0.1.0)",
     }
+
+
+def _discord_request(method: str, url: str, **kwargs) -> requests.Response:
+    """Exécute une requête HTTP vers l'API Discord avec gestion du rate-limit 429 et des erreurs 5xx."""
+    kwargs.setdefault("headers", _headers())
+    kwargs.setdefault("timeout", 15)
+    max_retries = 3
+    retryable_5xx = (500, 502, 503, 504)
+
+    for attempt in range(max_retries + 1):
+        response = requests.request(method, url, **kwargs)
+        if response.status_code == 429 and attempt < max_retries:
+            retry_after: float | None = None
+            try:
+                data = response.json()
+                if isinstance(data, dict):
+                    raw_retry = data.get("retry_after") or data.get("Retry-After")
+                    if raw_retry is not None:
+                        retry_after = float(raw_retry)
+            except (ValueError, TypeError, AttributeError):
+                pass
+            if retry_after is None:
+                header_retry = response.headers.get("Retry-After") or response.headers.get(
+                    "X-RateLimit-Reset-After"
+                )
+                try:
+                    retry_after = float(header_retry) if header_retry is not None else 1.0
+                except (ValueError, TypeError):
+                    retry_after = 1.0
+            time.sleep(max(0.0, retry_after))
+            continue
+
+        if response.status_code in retryable_5xx and attempt < max_retries:
+            time.sleep(float(attempt + 1))
+            continue
+
+        return response
+
+    return response
 
 
 def build_ongoing_embed(p: Perturbation, now: datetime | None = None) -> dict:
@@ -74,18 +116,37 @@ def build_ongoing_embed(p: Perturbation, now: datetime | None = None) -> dict:
         f"**Stations non desservies :**\n{stations_block}"
     )
 
-    return {
+    if len(description) > 4096:
+        description = description[:4093] + "..."
+
+    embed = {
         "title": title,
         "description": description,
         "color": color,
         "footer": {"text": f"réf: {p.fingerprint}"},
     }
+    for field in embed.get("fields", []):
+        val = field.get("value", "")
+        if len(val) > 1024:
+            field["value"] = val[:1021] + "..."
+    return embed
 
 
-def build_resolved_embed(incident: TrackedIncident, now: datetime | None = None) -> dict:
+def build_resolved_embed(
+    incident: TrackedIncident,
+    now: datetime | None = None,
+    severity: str | None = None,
+) -> dict:
     """Construit l'Embed Discord vert annonçant le rétablissement du trafic."""
     if now is None:
         now = datetime.now(TIMEZONE)
+
+    effective_severity = severity if severity is not None else getattr(incident, "severity", SEVERITY_RED)
+    end_label = (
+        "Fin de l'interruption"
+        if effective_severity == SEVERITY_RED
+        else "Fin de la perturbation"
+    )
 
     total_duration = format_duration(now - incident.start_time)
     start_str = incident.start_time.strftime("%Hh%M")
@@ -100,7 +161,7 @@ def build_resolved_embed(incident: TrackedIncident, now: datetime | None = None)
     )
 
     return {
-        "title": f"🟢 {incident.line_name} - Fin de l'interruption",
+        "title": f"🟢 {incident.line_name} - {end_label}",
         "description": description,
         "color": COLOR_GREEN,
         "footer": {"text": f"réf: {incident.fingerprint} • résolu"},
@@ -110,7 +171,7 @@ def build_resolved_embed(incident: TrackedIncident, now: datetime | None = None)
 def delete_message(message_id: str) -> None:
     """Supprime un message du salon Discord (ignore silencieusement s'il a déjà été supprimé)."""
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages/{message_id}"
-    response = requests.delete(url, headers=_headers(), timeout=15)
+    response = _discord_request("DELETE", url)
     if response.status_code not in (200, 204, 404):
         response.raise_for_status()
 
@@ -124,13 +185,16 @@ def sync_channel_state(
         now = datetime.now(TIMEZONE)
 
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages?limit={limit}"
-    response = requests.get(url, headers=_headers(), timeout=15)
+    response = _discord_request("GET", url)
     response.raise_for_status()
     messages = response.json()
 
     open_incidents: dict[str, TrackedIncident] = {}
 
     for msg in messages:
+        if "author" in msg and not msg["author"].get("bot", True):
+            continue
+
         msg_id = msg["id"]
         embeds = msg.get("embeds") or []
         if not embeds:
@@ -157,6 +221,11 @@ def sync_channel_state(
             continue
 
         raw_title = embed.get("title", "")
+        severity = (
+            SEVERITY_ORANGE
+            if embed.get("color") == COLOR_ORANGE or "Perturbation" in raw_title
+            else SEVERITY_RED
+        )
         line_name = re.sub(r"^[🔴🟠🟢]\s*", "", raw_title).split(" - ")[0].strip() or "Réseau Ilévia"
         line_fp = compute_fingerprint(line_name, line_name)
 
@@ -179,9 +248,26 @@ def sync_channel_state(
             m_date = DATE_REGEX.search(raw_desc)
             if m_date:
                 day, month = int(m_date.group(1)), int(m_date.group(2))
-                candidate = now.replace(month=month, day=day, hour=h, minute=m, second=0, microsecond=0)
-                if candidate > now + timedelta(minutes=5):
-                    candidate = candidate.replace(year=now.year - 1)
+                try:
+                    candidate = now.replace(month=month, day=day, hour=h, minute=m, second=0, microsecond=0)
+                    if candidate > now + timedelta(minutes=5):
+                        candidate = candidate.replace(year=now.year - 1)
+                except ValueError:
+                    candidate = msg_ts
+                    for y in range(now.year - 1, now.year - 5, -1):
+                        try:
+                            candidate = now.replace(
+                                year=y,
+                                month=month,
+                                day=day,
+                                hour=h,
+                                minute=m,
+                                second=0,
+                                microsecond=0,
+                            )
+                            break
+                        except ValueError:
+                            continue
             else:
                 candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if candidate > now + timedelta(minutes=5):
@@ -194,6 +280,7 @@ def sync_channel_state(
             line_name=line_name,
             stations=stations,
             start_time=start_dt,
+            severity=severity,
         )
 
     return open_incidents
@@ -203,7 +290,7 @@ def send_ongoing_notification(p: Perturbation, now: datetime | None = None) -> s
     """Publie un nouvel Embed d'alerte sur Discord et retourne l'identifiant du message créé."""
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages"
     embed = build_ongoing_embed(p, now=now)
-    response = requests.post(url, headers=_headers(), json={"embeds": [embed]}, timeout=15)
+    response = _discord_request("POST", url, json={"embeds": [embed]})
     response.raise_for_status()
     return response.json()["id"]
 
@@ -212,15 +299,15 @@ def update_ongoing_message(message_id: str, p: Perturbation, now: datetime | Non
     """Met à jour silencieusement un Embed d'alerte existant sans déclencher de notification push."""
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages/{message_id}"
     embed = build_ongoing_embed(p, now=now)
-    response = requests.patch(url, headers=_headers(), json={"embeds": [embed]}, timeout=15)
+    response = _discord_request("PATCH", url, json={"embeds": [embed]})
     response.raise_for_status()
 
 
 def resolve_incident(incident: TrackedIncident, now: datetime | None = None) -> str:
     """Remplace l'Embed d'alerte par un Embed vert de fin d'interruption."""
-    delete_message(incident.message_id)
     url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages"
-    embed = build_resolved_embed(incident, now=now)
-    response = requests.post(url, headers=_headers(), json={"embeds": [embed]}, timeout=15)
+    embed = build_resolved_embed(incident, now=now, severity=incident.severity)
+    response = _discord_request("POST", url, json={"embeds": [embed]})
     response.raise_for_status()
+    delete_message(incident.message_id)
     return response.json()["id"]
